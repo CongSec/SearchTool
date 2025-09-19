@@ -33,7 +33,8 @@
 
 ### 批量处理界面
 
-<img width="2086" height="1108" alt="image" src="https://github.com/user-attachments/assets/77c5dd38-461e-43e0-b5b1-200bf8b345a4" />
+<img width="1893" height="1466" alt="image" src="https://github.com/user-attachments/assets/1093b06c-b8b3-40cf-aeb2-54400d9b1003" />
+
 
 
 ### 结果导出界面
