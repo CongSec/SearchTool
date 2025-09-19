@@ -5,6 +5,7 @@ import json
 import os
 import re
 import csv
+import chardet
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -12,7 +13,7 @@ from PyQt5.QtWidgets import (
     QSpinBox, QTabWidget, QFileDialog, QMessageBox, QProgressBar,
     QGroupBox, QFrame, QDialog, QDialogButtonBox, QCheckBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt5.QtGui import QTextCharFormat, QColor, QSyntaxHighlighter
 from PyQt5.QtWidgets import QPlainTextEdit
 
@@ -67,18 +68,21 @@ class WorkerThread(QThread):
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
 
-    def __init__(self, config, files):
+    def __init__(self, config, files, auto_detect_encoding=True):
         super().__init__()
         self.config = config
         self.files = files
         self.is_running = True
         self.chunk_size = 1024 * 1024  # 1MB chunks for large files
+        self.auto_detect_encoding = auto_detect_encoding
+        self.encoding_cache = {}  # 缓存已检测的文件编码
 
     def run(self):
         try:
             total_files = len(self.files)
             all_results = []
             result_texts = []
+            
             for i, file_path in enumerate(self.files):
                 if not self.is_running:
                     break
@@ -92,45 +96,104 @@ class WorkerThread(QThread):
                     all_results.extend(file_results)
                     result_texts.append(result_text)
                 except Exception as e:
-                    self.error_signal.emit(f"读取文件 {file_path} 时出错: {e}")
+                    self.error_signal.emit(f"读取文件 {file_path} 时出错: {str(e)}")
+                    continue
 
             full_result_text = "\n".join(result_texts)
             full_result_text = f"处理完成！共处理 {total_files} 个文件\n\n" + full_result_text
             self.result_signal.emit(full_result_text, all_results)
         except Exception as e:
-            self.error_signal.emit(f"处理过程中出错: {e}")
+            self.error_signal.emit(f"处理过程中出错: {str(e)}")
         finally:
             self.finished_signal.emit()
 
     def stop(self):
         self.is_running = False
 
-    def read_file_optimized(self, file_path):
+    def detect_encoding(self, file_path):
+        # 先检查缓存
+        if file_path in self.encoding_cache:
+            return self.encoding_cache[file_path]
+        
+        # 小文件快速检测
         try:
             with open(file_path, 'rb') as f:
-                chunk = f.read(1024)
-                if b'\x00' in chunk:
-                    return None  # Binary file, skip
+                raw_data = f.read(10240)  # 读取前10KB检测
+                if not raw_data.strip():
+                    return 'utf-8'
+                
+                result = chardet.detect(raw_data)
+                encoding = result['encoding'] or 'utf-8'
+                encoding = encoding.lower().replace('utf-16le', 'utf-16').replace('utf-16be', 'utf-16')
+                
+                # 验证编码是否有效
+                try:
+                    raw_data.decode(encoding)
+                    self.encoding_cache[file_path] = encoding
+                    return encoding
+                except UnicodeDecodeError:
+                    pass
+            
+            # 如果快速检测失败，尝试常见编码
+            for enc in ['utf-8', 'gbk', 'gb18030', 'big5', 'utf-16']:
+                try:
+                    with open(file_path, 'r', encoding=enc) as f:
+                        f.read(100)  # 简单读取验证
+                    self.encoding_cache[file_path] = enc
+                    return enc
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            
+            # 终极方案：忽略错误读取
+            return 'utf-8'
+        except Exception:
+            return 'utf-8'
 
+    def read_file_optimized(self, file_path):
+        try:
+            # 1. 二进制头过滤
+            with open(file_path, 'rb') as f:
+                head = f.read(1024)
+                if b'\x00' in head:
+                    return None
+            
+            # 2. 获取文件编码
+            if self.auto_detect_encoding:
+                encoding = self.detect_encoding(file_path)
+            else:
+                encoding = 'utf-8'
+            
+            # 3. 高效读取大文件
             file_size = os.path.getsize(file_path)
-            if file_size > 10 * 1024 * 1024:  # For files larger than 10MB
-                content = []
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            if file_size > 10 * 1024 * 1024:  # 大于10MB的文件
+                chunks = []
+                with open(file_path, 'rb') as f:
                     while True:
                         chunk = f.read(self.chunk_size)
                         if not chunk:
                             break
-                        content.append(chunk)
-                        if not self.is_running:
-                            return None
-                return ''.join(content)
+                        try:
+                            chunks.append(chunk.decode(encoding, errors='ignore'))
+                        except Exception:
+                            try:
+                                chunks.append(chunk.decode('utf-8', errors='ignore'))
+                            except Exception:
+                                chunks.append(chunk.decode('gbk', errors='ignore'))
+                return ''.join(chunks)
             else:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    return f.read()
-        except UnicodeDecodeError:
-            return None  # Skip files that can't be decoded as text
+                # 小文件一次性读取
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                try:
+                    return data.decode(encoding, errors='ignore')
+                except Exception:
+                    try:
+                        return data.decode('utf-8', errors='ignore')
+                    except Exception:
+                        return data.decode('gbk', errors='ignore')
         except Exception as e:
-            raise e
+            self.error_signal.emit(f"读取文件 {file_path} 时出错: {str(e)}")
+            return None
 
     def process_text(self, text, config, source="unknown"):
         keywords = config["keywords"]
@@ -276,6 +339,7 @@ class WorkerThread(QThread):
 class CongsecGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.settings = QSettings("CongSec", "TextProcessor")
         self.config = self.load_config()
         self.worker_thread = None
         self.current_results = []
@@ -354,11 +418,16 @@ class CongsecGUI(QMainWindow):
         up_layout.addWidget(self.up_spin)
         config_group_layout.addLayout(up_layout)
 
-        # ★★★ 新增：后台自动导出开关
         self.auto_export_cb = QCheckBox("后台自动导出CSV")
         self.auto_export_cb.setChecked(self.config.get("auto_export", True))
         self.auto_export_cb.toggled.connect(self.toggle_auto_export)
         config_group_layout.addWidget(self.auto_export_cb)
+
+        # 新增：自动识别编码选项
+        self.auto_detect_encoding_cb = QCheckBox("自动识别文件编码(降低性能)")
+        self.auto_detect_encoding_cb.setChecked(self.config.get("auto_detect_encoding", True))
+        self.auto_detect_encoding_cb.toggled.connect(self.toggle_auto_detect_encoding)
+        config_group_layout.addWidget(self.auto_detect_encoding_cb)
 
         config_layout.addWidget(config_group)
         config_layout.addStretch()
@@ -472,8 +541,10 @@ class CongsecGUI(QMainWindow):
             "nearby_chars": 20,
             "down_lines": 0,
             "up_lines": 0,
-            "auto_export": True  # ★★★ 新增
+            "auto_export": True,
+            "auto_detect_encoding": True
         }
+        
         if os.path.exists(config_path):
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
@@ -540,9 +611,12 @@ class CongsecGUI(QMainWindow):
         self.save_config()
         self.update_keyword_list()
 
-    # ★★★ 新增：切换自动导出
     def toggle_auto_export(self, checked):
         self.config["auto_export"] = checked
+        self.save_config()
+
+    def toggle_auto_detect_encoding(self, checked):
+        self.config["auto_detect_encoding"] = checked
         self.save_config()
 
     def add_keyword_dialog(self):
@@ -752,7 +826,11 @@ class CongsecGUI(QMainWindow):
             "up_lines": self.config["up_lines"]
         }
 
-        self.worker_thread = WorkerThread(enabled_config, self.selected_files)
+        self.worker_thread = WorkerThread(
+            enabled_config, 
+            self.selected_files,
+            self.config.get("auto_detect_encoding", True)
+        )
         self.worker_thread.progress_signal.connect(self.update_progress)
         self.worker_thread.result_signal.connect(self.show_batch_results)
         self.worker_thread.error_signal.connect(self.show_error)
@@ -788,7 +866,6 @@ class CongsecGUI(QMainWindow):
         self.result_text.setPlainText(result_text)
         self.export_csv_btn.setVisible(len(results) > 0)
 
-        # 后台静默导出
         if self.config.get("auto_export", True) and results:
             self.auto_export_results(results, "batch")
 
@@ -803,7 +880,6 @@ class CongsecGUI(QMainWindow):
     def flush_buffer(self):
         if not self.result_buffer:
             self.buffer_timer.stop()
-            # 实时匹配结束，自动导出
             if self.config.get("auto_export", True) and self.current_results:
                 self.auto_export_results(self.current_results, "realtime")
             return
@@ -815,7 +891,6 @@ class CongsecGUI(QMainWindow):
         cursor.insertText("\n".join(chunk) + "\n")
         if not self.result_buffer:
             self.buffer_timer.stop()
-            # 实时匹配结束，自动导出
             if self.config.get("auto_export", True) and self.current_results:
                 self.auto_export_results(self.current_results, "realtime")
 
@@ -836,7 +911,7 @@ class CongsecGUI(QMainWindow):
             "up_lines": self.config["up_lines"]
         }
 
-        worker = WorkerThread(enabled_config, [])
+        worker = WorkerThread(enabled_config, [], self.config.get("auto_detect_encoding", True))
         result_text, results = worker.process_text(text, enabled_config, "实时输入")
 
         if not self.show_excluded_cb_realtime.isChecked():
@@ -858,12 +933,7 @@ class CongsecGUI(QMainWindow):
         self.result_text_realtime.clear()
         self.buffer_timer.start(100)
 
-    # 新增：后台自动导出逻辑
     def auto_export_results(self, results, prefix):
-        """
-        将结果静默导出到 data 目录，文件名：prefix_YYYYMMDD_HHMMSS.csv
-        prefix = batch / realtime
-        """
         try:
             os.makedirs("data", exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -877,7 +947,7 @@ class CongsecGUI(QMainWindow):
                 for row in results:
                     writer.writerow(row)
         except Exception as e:
-            pass
+            QMessageBox.warning(self, "警告", f"自动导出失败: {str(e)}")
 
     def export_to_csv(self):
         if not self.current_results:
@@ -897,7 +967,7 @@ class CongsecGUI(QMainWindow):
                 export_thread.wait()
                 QMessageBox.information(self, "成功", f"结果已导出到: {filename}")
             except Exception as e:
-                QMessageBox.critical(self, "错误", f"导出失败: {e}")
+                QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
 
     def export_realtime_to_csv(self):
         self.export_to_csv()
