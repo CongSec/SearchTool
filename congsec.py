@@ -23,18 +23,34 @@ class ResultHighlighter(QSyntaxHighlighter):
         super().__init__(parent)
         self.highlighting_rules = []
 
+        # 关键字高亮（黄色背景）
         keyword_format = QTextCharFormat()
         keyword_format.setBackground(QColor(255, 255, 0))
         self.highlighting_rules.append((re.compile(r"关键字列表: (.+)"), keyword_format))
 
+        # 匹配统计高亮（黄色背景）
         match_format = QTextCharFormat()
         match_format.setBackground(QColor(255, 255, 0))
         self.highlighting_rules.append((re.compile(r"匹配到 \d+ 个关键字列表"), match_format))
 
+        # 文件路径高亮（蓝色加粗）
+        file_format = QTextCharFormat()
+        file_format.setForeground(QColor(0, 0, 255))
+        file_format.setFontWeight(75)
+        self.highlighting_rules.append((re.compile(r"文件路径: .+"), file_format))
+        self.highlighting_rules.append((re.compile(r"文件名: .+"), file_format))
+
+        # 标签高亮（浅黄色背景）
         label_format = QTextCharFormat()
         label_format.setBackground(QColor(255, 255, 200))
-        self.highlighting_rules.append((re.compile(r"附近行内容:|附近文字:|文件:|-{50}|排除文本:|向下行内容:|向上行内容:"), label_format))
+        labels = [
+            r"附近行内容:", r"附近文字:", r"文件:", r"-{50}", 
+            r"排除文本:", r"向下行内容:", r"向上行内容:"
+        ]
+        for label in labels:
+            self.highlighting_rules.append((re.compile(label), label_format))
 
+        # 排除文本高亮（浅红色背景）
         exclude_format = QTextCharFormat()
         exclude_format.setBackground(QColor(255, 200, 200))
         self.highlighting_rules.append((re.compile(r"已排除（.*）"), exclude_format))
@@ -92,7 +108,7 @@ class WorkerThread(QThread):
                     if content is None:
                         continue  # Skip binary files
 
-                    result_text, file_results = self.process_text(content, self.config, f"文件: {os.path.basename(file_path)}")
+                    result_text, file_results = self.process_text(content, self.config, file_path)
                     all_results.extend(file_results)
                     result_texts.append(result_text)
                 except Exception as e:
@@ -195,7 +211,7 @@ class WorkerThread(QThread):
             self.error_signal.emit(f"读取文件 {file_path} 时出错: {str(e)}")
             return None
 
-    def process_text(self, text, config, source="unknown"):
+    def process_text(self, text, config, file_path):
         keywords = config["keywords"]
         nearby_lines = config["nearby_lines"]
         nearby_chars = config["nearby_chars"]
@@ -203,6 +219,11 @@ class WorkerThread(QThread):
         result_lines = []
         total_hits = 0
         lines = text.splitlines()
+
+        # 添加文件信息头
+        result_lines.append(f"文件路径: {file_path}")
+        result_lines.append(f"文件名: {os.path.basename(file_path)}")
+        result_lines.append("-" * 50)
 
         for kw in keywords:
             words = kw.get("words", [])
@@ -218,10 +239,12 @@ class WorkerThread(QThread):
                 if not words:
                     continue
 
+                # 准备附近内容
                 start_line = max(0, line_no - 1 - kw_lines)
                 end_line = min(len(lines), line_no + kw_lines)
                 nearby_lines_text = "\n".join(lines[start_line:end_line])
 
+                # 准备向下内容
                 down_text = ""
                 if down_lines != 0:
                     if down_lines > 0:
@@ -232,6 +255,7 @@ class WorkerThread(QThread):
                         down_end = line_no
                     down_text = "\n".join(lines[down_start:down_end])
 
+                # 准备向上内容
                 up_text = ""
                 if up_lines != 0:
                     if up_lines > 0:
@@ -242,6 +266,7 @@ class WorkerThread(QThread):
                         up_end = min(len(lines), line_no - 1 - up_lines)
                     up_text = "\n".join(lines[up_start:up_end])
 
+                # 准备附近字符内容
                 nearby_chars_text = ""
                 if kw_chars > 0:
                     pattern = re.compile(r'(' + '|'.join(re.escape(word) for word in words[0:1]) + ')')
@@ -266,6 +291,7 @@ class WorkerThread(QThread):
                                 unique_parts.append(part)
                         nearby_chars_text = "\n".join(unique_parts)
 
+                # 检查匹配
                 match_success = False
                 if multi_line_exclude:
                     if any(w in line for w in words[0:1]):
@@ -292,6 +318,7 @@ class WorkerThread(QThread):
                 if not match_success:
                     continue
 
+                # 检查排除文本
                 combined_text = line
                 if exclude_nearby:
                     combined_text += nearby_lines_text + nearby_chars_text + down_text + up_text
@@ -302,6 +329,7 @@ class WorkerThread(QThread):
                     result_lines.append("-" * 50)
                     continue
 
+                # 记录匹配结果
                 total_hits += 1
                 result_lines.append(f"关键字列表: {' + '.join(words)}（位于第 {line_no} 行）")
                 result_lines.append("附近行内容:")
@@ -319,6 +347,7 @@ class WorkerThread(QThread):
                     result_lines.append(up_text)
                 result_lines.append("-" * 50)
 
+                # 保存结果数据
                 results.append({
                     "keywords": " + ".join(words),
                     "line_number": line_no,
@@ -326,12 +355,14 @@ class WorkerThread(QThread):
                     "nearby_chars": nearby_chars_text,
                     "down_lines": down_text,
                     "up_lines": up_text,
-                    "source": source,
+                    "source": os.path.basename(file_path),
+                    "file_path": file_path,
                     "exclude_text": "; ".join(exclude)
                 })
 
+        # 插入匹配统计信息
         header = f"匹配到 {total_hits} 个关键字列表"
-        result_lines.insert(0, header)
+        result_lines.insert(3, header)
         result_text = "\n".join(result_lines)
         return result_text, results
 
@@ -361,12 +392,14 @@ class CongsecGUI(QMainWindow):
         config_panel.setMaximumWidth(300)
         config_layout = QVBoxLayout(config_panel)
 
+        # 关键字列表部分
         keyword_group = QGroupBox("关键字列表")
         keyword_layout = QVBoxLayout(keyword_group)
         self.keyword_list = QListWidget()
         self.update_keyword_list()
         keyword_layout.addWidget(self.keyword_list)
 
+        # 关键字操作按钮
         add_keyword_btn = QPushButton("添加关键字")
         add_keyword_btn.clicked.connect(self.add_keyword_dialog)
         keyword_layout.addWidget(add_keyword_btn)
@@ -380,9 +413,11 @@ class CongsecGUI(QMainWindow):
         keyword_layout.addWidget(delete_keyword_btn)
         config_layout.addWidget(keyword_group)
 
+        # 默认配置部分
         config_group = QGroupBox("默认配置")
         config_group_layout = QVBoxLayout(config_group)
 
+        # 附近行数设置
         lines_layout = QHBoxLayout()
         lines_layout.addWidget(QLabel("默认附近行数:"))
         self.lines_spin = QSpinBox()
@@ -392,6 +427,7 @@ class CongsecGUI(QMainWindow):
         lines_layout.addWidget(self.lines_spin)
         config_group_layout.addLayout(lines_layout)
 
+        # 附近字符数设置
         chars_layout = QHBoxLayout()
         chars_layout.addWidget(QLabel("默认附近字符数:"))
         self.chars_spin = QSpinBox()
@@ -400,6 +436,7 @@ class CongsecGUI(QMainWindow):
         chars_layout.addWidget(self.chars_spin)
         config_group_layout.addLayout(chars_layout)
 
+        # 向下行数设置
         down_layout = QHBoxLayout()
         down_layout.addWidget(QLabel("默认向下行数:"))
         self.down_spin = QSpinBox()
@@ -409,6 +446,7 @@ class CongsecGUI(QMainWindow):
         down_layout.addWidget(self.down_spin)
         config_group_layout.addLayout(down_layout)
 
+        # 向上行数设置
         up_layout = QHBoxLayout()
         up_layout.addWidget(QLabel("默认向上行数:"))
         self.up_spin = QSpinBox()
@@ -418,13 +456,14 @@ class CongsecGUI(QMainWindow):
         up_layout.addWidget(self.up_spin)
         config_group_layout.addLayout(up_layout)
 
+        # 自动导出选项
         self.auto_export_cb = QCheckBox("后台自动导出CSV")
         self.auto_export_cb.setChecked(self.config.get("auto_export", True))
         self.auto_export_cb.toggled.connect(self.toggle_auto_export)
         config_group_layout.addWidget(self.auto_export_cb)
 
-        # 新增：自动识别编码选项
-        self.auto_detect_encoding_cb = QCheckBox("自动识别文件编码(降低性能)")
+        # 自动识别编码选项
+        self.auto_detect_encoding_cb = QCheckBox("自动识别文件编码")
         self.auto_detect_encoding_cb.setChecked(self.config.get("auto_detect_encoding", True))
         self.auto_detect_encoding_cb.toggled.connect(self.toggle_auto_detect_encoding)
         config_group_layout.addWidget(self.auto_detect_encoding_cb)
@@ -440,6 +479,7 @@ class CongsecGUI(QMainWindow):
         batch_tab = QWidget()
         batch_layout = QVBoxLayout(batch_tab)
 
+        # 文件选择部分
         file_group = QGroupBox("文件选择")
         file_layout = QVBoxLayout(file_group)
 
@@ -455,6 +495,7 @@ class CongsecGUI(QMainWindow):
         file_layout.addWidget(self.selected_files_label)
         batch_layout.addWidget(file_group)
 
+        # 进度显示
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         batch_layout.addWidget(self.progress_bar)
@@ -462,10 +503,12 @@ class CongsecGUI(QMainWindow):
         self.progress_label.setVisible(False)
         batch_layout.addWidget(self.progress_label)
 
+        # 显示排除选项
         self.show_excluded_cb_batch = QCheckBox("显示已排除提示")
         self.show_excluded_cb_batch.setChecked(False)
         batch_layout.addWidget(self.show_excluded_cb_batch)
 
+        # 处理按钮
         process_btn = QPushButton("开始批量处理")
         process_btn.clicked.connect(self.start_batch_processing)
         batch_layout.addWidget(process_btn)
@@ -480,6 +523,7 @@ class CongsecGUI(QMainWindow):
         self.export_csv_btn.setVisible(False)
         batch_layout.addWidget(self.export_csv_btn)
 
+        # 结果展示部分
         result_group = QGroupBox("匹配结果")
         result_layout = QVBoxLayout(result_group)
         self.result_text = QPlainTextEdit()
@@ -497,6 +541,7 @@ class CongsecGUI(QMainWindow):
         realtime_tab = QWidget()
         realtime_layout = QVBoxLayout(realtime_tab)
 
+        # 输入部分
         input_group = QGroupBox("输入文本")
         input_layout = QVBoxLayout(input_group)
         self.input_text = QPlainTextEdit()
@@ -512,6 +557,7 @@ class CongsecGUI(QMainWindow):
         input_layout.addWidget(process_realtime_btn)
         realtime_layout.addWidget(input_group)
 
+        # 结果展示部分
         result_group_realtime = QGroupBox("匹配结果")
         result_layout_realtime = QVBoxLayout(result_group_realtime)
         self.result_text_realtime = QPlainTextEdit()
@@ -549,6 +595,7 @@ class CongsecGUI(QMainWindow):
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
+                    # 兼容旧版配置
                     for idx, kw in enumerate(config.get("keywords", [])):
                         if isinstance(kw, str):
                             config["keywords"][idx] = {
@@ -569,6 +616,7 @@ class CongsecGUI(QMainWindow):
                             kw.setdefault("up_lines", 0)
                             kw.setdefault("exclude_nearby", True)
                             kw.setdefault("multi_line_exclude", False)
+                    # 确保所有默认配置项都存在
                     for key in default_config:
                         config.setdefault(key, default_config[key])
                     return config
@@ -576,6 +624,7 @@ class CongsecGUI(QMainWindow):
                 QMessageBox.warning(self, "配置错误", f"读取配置文件出错: {e}，使用默认配置")
                 return default_config.copy()
         else:
+            # 创建默认配置文件
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(default_config, f, ensure_ascii=False, indent=4)
             return default_config.copy()
@@ -941,7 +990,7 @@ class CongsecGUI(QMainWindow):
             with open(filename, "w", newline='', encoding='utf-8-sig') as f:
                 writer = csv.DictWriter(f, fieldnames=[
                     'keywords', 'line_number', 'nearby_lines', 'nearby_chars',
-                    'down_lines', 'up_lines', 'source', 'exclude_text'
+                    'down_lines', 'up_lines', 'source', 'file_path', 'exclude_text'
                 ])
                 writer.writeheader()
                 for row in results:
@@ -999,7 +1048,7 @@ class ExportThread(QThread):
         try:
             with open(self.filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 fieldnames = ['keywords', 'line_number', 'nearby_lines', 'nearby_chars',
-                            'down_lines', 'up_lines', 'source', 'exclude_text']
+                            'down_lines', 'up_lines', 'source', 'file_path', 'exclude_text']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 for result in self.results:
